@@ -16,6 +16,14 @@ export type CitationFormat = 'gb_t_7714' | 'apa' | 'bibtex'
 export type SortOrder = 'relevance' | 'date' | 'citations'
 
 /**
+ * 关键词匹配方式（仅 arXiv 生效）。
+ * - all：每个词都要出现（默认，召回高）
+ * - phrase：连续完整短语（精度高，召回低）
+ * 关键词自带引号时自动按 phrase 处理。
+ */
+export type MatchMode = 'all' | 'phrase'
+
+/**
  * 单篇论文统一结构（对应 PRD §4.1 Paper）。
  * - id：内部唯一 ID，`arxiv:<arxivId>` 或 `s2:<semanticScholarPaperId>`，
  *   供 detail / add / cite / remove 工具引用。
@@ -71,6 +79,11 @@ export interface ResolvedConfig {
   cache_ttl_seconds: number
   /** 单会话文献库最大条目数。 */
   max_library_size: number
+  /**
+   * Semantic Scholar API Key。
+   * 配置项优先，缺省回退环境变量 S2_API_KEY（只读环境变量即可，密钥不必落盘）。
+   */
+  semantic_scholar_api_key: string
 }
 
 /** 统一检索过滤条件。 */
@@ -81,12 +94,16 @@ export interface SearchFilter {
   yearTo?: number
   maxResults: number
   sort: SortOrder
+  /** 关键词匹配方式；缺省按 all 处理（关键词自带引号时按 phrase）。 */
+  matchMode?: MatchMode
 }
 
 /** HTTP 请求通用选项。 */
 export interface HttpOptions {
   timeoutMs: number
   signal?: AbortSignal
+  /** Semantic Scholar API Key；缺省时按共享池限流处理。 */
+  s2ApiKey?: string
 }
 
 /** 数据源层抛出的可读错误（含友好 message 与可选 code）。 */

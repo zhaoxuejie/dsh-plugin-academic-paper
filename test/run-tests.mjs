@@ -1,8 +1,9 @@
 // dsh-plugin-academic-paper 测试套件
 // 用法：node test/run-tests.mjs
 // 覆盖：
-//   单测（无网络）：XML 解析 / 引用格式 / 文献库去重与导出 / paperId 解析 / 配置归一化
-//   集成冒烟（有网络）：arXiv 搜索与详情 / Semantic Scholar 搜索与详情（429 时自动跳过，不失败）
+//   单测（无网络）：XML 解析 / 引用格式 / 期刊解析 / 文献库去重与导出 / paperId 解析
+//                 配置归一化 / arXiv 查询构造 / 限流防护（请求闸、冷却、退避、single-flight）
+//   集成冒烟（有网络）：arXiv 搜索与详情 / Semantic Scholar 搜索与详情（429 或冷却时自动跳过，不失败）
 // 断言用 node:assert，用例失败 exit 1。
 
 import { test, describe, beforeEach } from 'node:test'
@@ -24,14 +25,24 @@ const {
   bibtexKey,
   splitName,
   escapeLatex,
+  parseJournalRef,
   AcademicStore,
+  AcademicSourceError,
   cacheKeyOf,
   buildFilter,
+  buildArxivQuery,
+  normalizeKeyword,
   searchArxiv,
   arxivDetail,
   searchSemanticScholar,
   semanticScholarDetail,
   resolveConfig,
+  gateFor,
+  cooldownGuard,
+  resetCooldown,
+  setCooldown,
+  upstreamOf,
+  retryWaitOf,
 } = plugin
 
 /* ------------------------------------------------------------------ */
@@ -202,6 +213,49 @@ describe('引用格式', () => {
     assert.deepEqual(splitName('Ashish Vaswani'), { surname: 'Vaswani', given: 'Ashish' })
     assert.deepEqual(splitName('张三'), { surname: '张三', given: '' })
   })
+
+  test('parseJournalRef：arXiv journal_ref 结构化，年份取刊年', () => {
+    const parsed = parseJournalRef('Physical Review Research vol. 4, no. 2, page 023066, April 2022')
+    assert.equal(parsed.name, 'Physical Review Research')
+    assert.equal(parsed.volume, '4')
+    assert.equal(parsed.issue, '2')
+    assert.equal(parsed.pages, '023066')
+    assert.equal(parsed.year, '2022')
+  })
+
+  test('GB/T 7714：期刊卷期页码规范化，且不出现两个年份', () => {
+    // 原始缺陷：journal_ref 被整串塞进 [J] 段，输出「… vol. 4, no. 2, page 023066, April 2022, 2020」
+    const paper = {
+      ...VASWANI,
+      year: 2020,
+      journal: 'Physical Review Research vol. 4, no. 2, page 023066, April 2022',
+      doi: '10.1103/PhysRevResearch.4.023066',
+    }
+    const out = formatGbT7714(paper, '2026-09-06')
+    assert.ok(out.includes('[J]. Physical Review Research, 2022, 4(2): 023066.'), out)
+    // 刊年优先：预印本年 2020 不应再出现在 [J] 段
+    assert.ok(!out.includes('2022, 2020'), out)
+    assert.ok(!out.includes('vol.'), out)
+  })
+
+  test('parseJournalRef：无法解析时回退原文，不丢信息', () => {
+    const raw = 'Some Unusual Venue That Defies Parsing'
+    const parsed = parseJournalRef(raw)
+    assert.equal(parsed.raw, raw)
+    const out = formatGbT7714({ ...VASWANI, journal: raw }, '2026-09-06')
+    assert.ok(out.includes(raw), out)
+  })
+
+  test('BibTeX：期刊拆成 journal / volume / number / pages', () => {
+    const out = formatBibtex({
+      ...VASWANI,
+      journal: 'IEEE Transactions on Information Theory, vol. 45, no. 3, pp. 1-15, 2023',
+    })
+    assert.ok(out.includes('journal = {IEEE Transactions on Information Theory}'), out)
+    assert.ok(out.includes('volume = 45'), out)
+    assert.ok(out.includes('number = 3'), out)
+    assert.ok(out.includes('pages = 1-15'), out)
+  })
 })
 
 /* ------------------------------------------------------------------ */
@@ -333,10 +387,12 @@ describe('配置归一化', () => {
   test('默认值', () => {
     const cfg = resolveConfig({})
     assert.equal(cfg.enable, true)
-    assert.equal(cfg.default_source, 'semantic_scholar')
+    // 默认源为 arXiv：S2 未鉴权时是共享限流池，实测连续 429，不适合做默认。
+    assert.equal(cfg.default_source, 'arxiv')
     assert.equal(cfg.max_results, 10)
     assert.equal(cfg.default_cite_format, 'gb_t_7714')
-    assert.equal(cfg.request_timeout, 15)
+    // 15 秒对复杂短语查询不够（实测 15–45 秒），默认放宽到 30 秒。
+    assert.equal(cfg.request_timeout, 30)
     assert.equal(cfg.enable_cache, true)
     assert.equal(cfg.max_cache_entries, 50)
     assert.equal(cfg.cache_ttl_seconds, 300)
@@ -353,7 +409,7 @@ describe('配置归一化', () => {
       max_library_size: 3,
     })
     assert.equal(cfg.enable, true)
-    assert.equal(cfg.default_source, 'semantic_scholar')
+    assert.equal(cfg.default_source, 'arxiv')
     assert.equal(cfg.max_results, 50)
     assert.equal(cfg.request_timeout, 1)
     assert.equal(cfg.default_cite_format, 'gb_t_7714')
@@ -367,6 +423,168 @@ describe('配置归一化', () => {
     assert.equal(filter.yearFrom, 2020)
     assert.equal(filter.yearTo, 2024)
     assert.throws(() => buildFilter({ keyword: 'x', yearFrom: 2021, yearTo: 2020 }, cfg))
+  })
+
+  test('buildFilter 透传 matchMode，非法值丢弃', () => {
+    const cfg = resolveConfig({})
+    assert.equal(buildFilter({ keyword: 'x', matchMode: 'phrase' }, cfg).matchMode, 'phrase')
+    assert.equal(buildFilter({ keyword: 'x', matchMode: 'all' }, cfg).matchMode, 'all')
+    assert.equal(buildFilter({ keyword: 'x', matchMode: 'fuzzy' }, cfg).matchMode, undefined)
+  })
+
+  test('S2 API Key 可由配置项或环境变量提供', () => {
+    assert.equal(resolveConfig({ semantic_scholar_api_key: 'abc123' }).semantic_scholar_api_key, 'abc123')
+    const prev = process.env.S2_API_KEY
+    try {
+      process.env.S2_API_KEY = 'from-env'
+      assert.equal(resolveConfig({}).semantic_scholar_api_key, 'from-env')
+      // 配置项优先于环境变量
+      assert.equal(
+        resolveConfig({ semantic_scholar_api_key: 'from-config' }).semantic_scholar_api_key,
+        'from-config',
+      )
+    } finally {
+      if (prev === undefined) delete process.env.S2_API_KEY
+      else process.env.S2_API_KEY = prev
+    }
+  })
+})
+
+/* ------------------------------------------------------------------ */
+/* arXiv 查询构造（无网络）                                            */
+/* ------------------------------------------------------------------ */
+
+describe('arXiv 查询构造', () => {
+  const mk = (keyword, extra = {}) => buildArxivQuery({ keyword, maxResults: 10, sort: 'relevance', ...extra })
+
+  test('多词默认拆成 AND，而不是整串精确短语', () => {
+    // 原始缺陷：整串包成短语 → 5 词查询实测 totalResults=0；拆词后同查询 602 篇。
+    assert.equal(
+      mk('retrieval augmented generation long context'),
+      'all:"retrieval" AND all:"augmented" AND all:"generation" AND all:"long" AND all:"context"',
+    )
+  })
+
+  test('单词与原先行为一致', () => {
+    assert.equal(mk('transformer'), 'all:"transformer"')
+  })
+
+  test('整串加引号 → 尊重为用户要精确短语', () => {
+    assert.equal(mk('"retrieval augmented generation"'), 'all:"retrieval augmented generation"')
+  })
+
+  test('局部引号 → 引号内作短语，引号外仍拆词', () => {
+    assert.equal(
+      mk('retrieval "augmented generation" long'),
+      'all:"retrieval" AND all:"long" AND all:"augmented generation"',
+    )
+  })
+
+  test('中文引号同样被识别，不进入 search_query 造成 HTTP 400', () => {
+    assert.equal(mk('“attention mechanism”'), 'all:"attention mechanism"')
+    assert.ok(!mk('retrieval “augmented generation” long').includes('“'))
+  })
+
+  test('matchMode 覆盖自动推断', () => {
+    assert.equal(mk('a b c', { matchMode: 'phrase' }), 'all:"a b c"')
+    assert.equal(mk('"a b"', { matchMode: 'all' }), 'all:"a" AND all:"b"')
+  })
+
+  test('作者与年份过滤仍然拼接', () => {
+    const q = mk('transformer', { author: 'Vaswani', yearFrom: 2017, yearTo: 2020 })
+    assert.ok(q.includes('AND au:"Vaswani"'))
+    assert.ok(q.includes('AND submittedDate:[20170101 TO 20201231]'))
+  })
+
+  test('normalizeKeyword 三种形态', () => {
+    assert.deepEqual(normalizeKeyword('"a b c"'), { keyword: 'a b c', phrase: true, quoted: [] })
+    assert.deepEqual(normalizeKeyword('a "b c" d'), { keyword: 'a d', phrase: false, quoted: ['b c'] })
+    assert.deepEqual(normalizeKeyword('a b c'), { keyword: 'a b c', phrase: false, quoted: [] })
+  })
+
+  test('空关键词抛 INVALID_ARG', () => {
+    assert.throws(() => mk('   '), (error) => error.code === 'INVALID_ARG')
+  })
+})
+
+/* ------------------------------------------------------------------ */
+/* 限流防护（无网络）                                                  */
+/* ------------------------------------------------------------------ */
+
+describe('限流防护', () => {
+  test('请求闸串行执行并保持最小间隔', async () => {
+    const gate = gateFor('other', 120)
+    const events = []
+    const job = (id) => async () => {
+      events.push(`start${id}`)
+      await new Promise((r) => setTimeout(r, 10))
+      events.push(`end${id}`)
+      return id
+    }
+    const t0 = Date.now()
+    const results = await Promise.all([gate(job(1)), gate(job(2)), gate(job(3))])
+    const elapsed = Date.now() - t0
+    assert.deepEqual(results, [1, 2, 3])
+    // 严格串行：没有交叠
+    assert.deepEqual(events, ['start1', 'end1', 'start2', 'end2', 'start3', 'end3'])
+    // 3 个请求至少 2 个间隔
+    assert.ok(elapsed >= 240, `elapsed=${elapsed}`)
+  })
+
+  test('冷却守卫在窗口内直接抛 COOLDOWN，不发请求', () => {
+    resetCooldown()
+    setCooldown('semantic_scholar', 5)
+    assert.throws(() => cooldownGuard('semantic_scholar', 'Semantic Scholar'), (error) => error.code === 'COOLDOWN')
+    // 另一个来源不受影响
+    assert.doesNotThrow(() => cooldownGuard('arxiv', 'arXiv'))
+    resetCooldown()
+  })
+
+  test('upstreamOf 按域名归类', () => {
+    assert.equal(upstreamOf('https://export.arxiv.org/api/query'), 'arxiv')
+    assert.equal(upstreamOf('https://api.semanticscholar.org/graph/v1/paper/search'), 'semantic_scholar')
+    assert.equal(upstreamOf('https://example.com/x'), 'other')
+  })
+
+  test('退避等待带抖动，且落在基准与 1.5 倍之间', () => {
+    const error = new AcademicSourceError('HTTP_500', 'boom', true)
+    for (let i = 0; i < 20; i++) {
+      const wait = retryWaitOf(error, 4000)
+      assert.ok(wait >= 4000 && wait <= 6000, `wait=${wait}`)
+    }
+  })
+
+  test('Retry-After 超出上限时不重试，直接抛不可重试错误', () => {
+    const error = new AcademicSourceError('HTTP_429', 'slow down', true, { retryAfterSeconds: 120 })
+    assert.throws(() => retryWaitOf(error, 4000), (thrown) => thrown.retriable === false)
+  })
+
+  test('缓存键区分 matchMode（避免 all / phrase 串味）', () => {
+    const cfg = resolveConfig({})
+    const base = buildFilter({ keyword: 'rag' }, cfg)
+    const keyAll = cacheKeyOf({ source: 'arxiv', filter: { ...base, matchMode: 'all' } })
+    const keyPhrase = cacheKeyOf({ source: 'arxiv', filter: { ...base, matchMode: 'phrase' } })
+    assert.notEqual(keyAll, keyPhrase)
+  })
+
+  test('singleFlight 让并发同名检索只执行一次', async () => {
+    const store = new AcademicStore()
+    let calls = 0
+    const factory = async () => {
+      calls++
+      await new Promise((r) => setTimeout(r, 30))
+      return ['p']
+    }
+    const [a, b] = await Promise.all([
+      store.singleFlight('s', 'k', factory),
+      store.singleFlight('s', 'k', factory),
+    ])
+    assert.equal(calls, 1)
+    assert.deepEqual(a, ['p'])
+    assert.deepEqual(b, ['p'])
+    // 前一轮结束后再调用会重新执行
+    await store.singleFlight('s', 'k', factory)
+    assert.equal(calls, 2)
   })
 })
 
@@ -479,7 +697,7 @@ describe('数据源集成冒烟（网络）', () => {
     assert.ok(paper.abstract.length > 0)
   })
 
-  test('Semantic Scholar 搜索（429 时跳过）', { timeout: 60000 }, async () => {
+  test('Semantic Scholar 搜索（429 / 冷却时跳过）', { timeout: 60000 }, async () => {
     let papers
     try {
       papers = await searchSemanticScholar(
@@ -487,7 +705,8 @@ describe('数据源集成冒烟（网络）', () => {
         { timeoutMs: 20000 },
       )
     } catch (error) {
-      if (error && error.code === 'HTTP_429') {
+      // 无 API Key 时 S2 稳定 429；冷却期内的 COOLDOWN 是同一件事的后续表现。
+      if (error && (error.code === 'HTTP_429' || error.code === 'COOLDOWN')) {
         console.log('  ↳ S2 搜索限流，跳过（错误：', error.message, '）')
         return
       }
@@ -498,12 +717,12 @@ describe('数据源集成冒烟（网络）', () => {
     assert.ok(papers[0].citationCount !== undefined)
   })
 
-  test('Semantic Scholar 详情（DOI / arXiv，404 或 429 时跳过）', { timeout: 60000 }, async () => {
+  test('Semantic Scholar 详情（DOI / arXiv，404 / 429 / 冷却时跳过）', { timeout: 60000 }, async () => {
     let paper
     try {
       paper = await semanticScholarDetail({ arxivId: '1706.03762' }, { timeoutMs: 20000 })
     } catch (error) {
-      if (error && (error.code === 'HTTP_429' || error.code === 'HTTP_404')) {
+      if (error && (error.code === 'HTTP_429' || error.code === 'HTTP_404' || error.code === 'COOLDOWN')) {
         console.log('  ↳ S2 详情不可用，跳过（错误：', error.message, '）')
         return
       }

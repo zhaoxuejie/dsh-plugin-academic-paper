@@ -5,15 +5,40 @@
  * - searchSemanticScholar：搜索（作者/年份在本地过滤，排序在本地完成 —— S2 搜索仅支持相关性排序）。
  * - semanticScholarDetail：按 paperId / DOI / arXiv ID / CorpusId 获取单篇详情。
  *
- * 限流策略（PRD §6.2.2 / §8）：429/5xx 自动退避重试一次；仍失败抛出友好错误，
- * 由上层在 source=both 时降级到 arXiv，在单源时提示用户切换数据源。
+ * 限流策略（PRD §6.2.2 / §8）：
+ * - 有 API Key 时携带 x-api-key 走独立配额（官方入门 1 RPS）。无 key 时吃全体未鉴权用户
+ *   共享的池子，实测稳定 429 且退避无解 —— 因此 429 不重试，直接提示配置 key 或换时间。
+ * - 所有请求经 gateS2 排队（默认 1.2 秒间隔），冷却期内直接拒绝，不发上游请求。
+ * - 5xx 仍按单次退避重试；429 由 http.ts 统一记为不可重试。
  */
 
-import { httpJson, httpJsonWithRetry } from '../http'
+import { cooldownGuard, gateS2, httpJson, httpJsonWithRetry } from '../http'
 import { AcademicSourceError } from '../types'
 import type { HttpOptions, Paper, PaperSource, SearchFilter } from '../types'
 
 const S2_BASE = 'https://api.semanticscholar.org/graph/v1'
+
+/**
+ * 搜索阶段字段：不含 abstract。
+ * 单条摘要有几百字，默认拉 50 条就是几百 KB 的响应体；搜索结果渲染只截 280 字，
+ * 完整摘要留给 academic_paper_detail 再取。
+ */
+const S2_SEARCH_FIELDS = [
+  'title',
+  'authors',
+  'year',
+  'publicationDate',
+  'venue',
+  'citationCount',
+  'externalIds',
+  'url',
+  'journal',
+  'isOpenAccess',
+  'openAccessPdf',
+  'publicationTypes',
+].join(',')
+
+/** 详情阶段字段：保留 abstract。 */
 const S2_FIELDS = [
   'title',
   'abstract',
@@ -29,6 +54,11 @@ const S2_FIELDS = [
   'openAccessPdf',
   'publicationTypes',
 ].join(',')
+
+/** S2 请求头：配置了 API Key 就带上，没配则由服务端按共享池限流。 */
+function s2Headers(opts: HttpOptions): Record<string, string> {
+  return opts.s2ApiKey ? { 'x-api-key': opts.s2ApiKey } : {}
+}
 
 interface S2Author {
   authorId?: string
@@ -128,12 +158,13 @@ export async function searchSemanticScholar(filter: SearchFilter, opts: HttpOpti
   if (!keyword) {
     throw new AcademicSourceError('INVALID_ARG', 'academic_search: keyword 不能为空')
   }
+  cooldownGuard('semantic_scholar', 'Semantic Scholar')
   const maxResults = Math.min(Math.max(1, filter.maxResults), 50)
-  // S2 单页 limit 上限 100；过滤损耗按 3 倍放大，封顶 100。
-  const fetchLimit = Math.min(Math.max(50, maxResults * 3), 100)
-  const url = `${S2_BASE}/paper/search?query=${encodeURIComponent(keyword)}&limit=${fetchLimit}&fields=${encodeURIComponent(S2_FIELDS)}&sort=relevance:desc`
+  // S2 单页 limit 上限 100；过滤损耗按 2 倍放大即可（原先固定 50 起会让「要 1 条」也拉 50 条）。
+  const fetchLimit = Math.min(Math.max(maxResults * 2, 20), 100)
+  const url = `${S2_BASE}/paper/search?query=${encodeURIComponent(keyword)}&limit=${fetchLimit}&fields=${encodeURIComponent(S2_SEARCH_FIELDS)}&sort=relevance:desc`
   const response = await httpJsonWithRetry<S2SearchResponse>(
-    () => httpJson<S2SearchResponse>(url, opts),
+    () => gateS2(() => httpJson<S2SearchResponse>(url, opts, s2Headers(opts))),
     4000,
   )
   const filtered = (response.data ?? [])
@@ -155,6 +186,7 @@ export async function semanticScholarDetail(
   identifier: { paperId?: string; doi?: string; arxivId?: string },
   opts: HttpOptions,
 ): Promise<Paper | null> {
+  cooldownGuard('semantic_scholar', 'Semantic Scholar')
   let path: string
   if (identifier.doi && identifier.doi.trim() !== '') {
     const doi = identifier.doi.trim()
@@ -171,7 +203,10 @@ export async function semanticScholarDetail(
   }
 
   const url = `${S2_BASE}/paper/${encodeURIComponent(path)}?fields=${encodeURIComponent(S2_FIELDS)}`
-  const response = await httpJsonWithRetry<S2Paper>(() => httpJson<S2Paper>(url, opts), 4000)
+  const response = await httpJsonWithRetry<S2Paper>(
+    () => gateS2(() => httpJson<S2Paper>(url, opts, s2Headers(opts))),
+    4000,
+  )
   if (!response || typeof response.paperId !== 'string') return null
   return s2PaperToPaper(response)
 }

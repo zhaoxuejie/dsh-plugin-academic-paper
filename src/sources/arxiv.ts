@@ -1,21 +1,33 @@
 /**
  * arXiv 数据源封装。
  *
- * 接口：http://export.arxiv.org/api/query（Atom XML，公开 API，无需鉴权）。
+ * 接口：https://export.arxiv.org/api/query（Atom XML，公开 API，无需鉴权）。
  * - searchArxiv：按关键词/作者/年份范围检索，支持相关性与日期排序（arXiv 不提供引用数，citations 排序回退相关性）。
  * - arxivDetail：按 arXiv ID 获取单篇元数据。
  *
  * 解析使用本插件自带的严格 XML 解析器（src/xml.ts），处理 HTML 实体转义与命名空间标签（arxiv:doi 等）。
+ *
+ * 查询构造（对应实测召回差异）：
+ * - 原先把整段关键词包成一条精确短语（all:"a b c d e"），词数越多越难命中，
+ *   5 词查询实测 totalResults=0；拆成 AND 项后同一查询 totalResults=602。
+ * - 用户给关键词加引号是常见写法，之前会被转义进 search_query 导致 HTTP 400。
+ *   现在把「加引号」识别为「要精确短语」的意图，不再当作非法输入。
+ *
+ * 请求节奏：arXiv 官方要求每 3 秒最多 1 次、同时只允许 1 个连接
+ * （https://info.arxiv.org/help/api/tou.html），因此所有请求都经过 gateArxiv 排队。
  */
 
-import { httpText, httpTextWithRetry } from '../http'
+import { cooldownGuard, gateArxiv, httpText, httpTextWithRetry } from '../http'
 import { AcademicSourceError } from '../types'
-import type { HttpOptions, Paper, SearchFilter } from '../types'
+import type { HttpOptions, MatchMode, Paper, SearchFilter } from '../types'
 import { attrOf, findChild, findAllDescendants, findAllChildren, parseXml, textOfCollapsed } from '../xml'
 
 const ARXIV_API = 'https://export.arxiv.org/api/query'
 const ARXIV_ABS = 'https://arxiv.org/abs'
 const ARXIV_PDF = 'https://arxiv.org/pdf'
+
+/** arXiv 429 后重试前的等待：官方间隔 3 秒，429 说明窗口已满，等得更久一些。 */
+const ARXIV_RETRY_FALLBACK_MS = 8000
 
 /** arXiv ID 规范形：`\d{4}\.\d{4,5}`（去除版本后缀 vN）。 */
 export const ARXIV_ID_RE = /^\d{4}\.\d{4,5}(?:v\d+)?$/
@@ -37,14 +49,71 @@ function escapeQueryToken(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-/** 构建 arXiv search_query（关键词 + 作者 + 年份范围）。 */
-export function buildArxivQuery(filter: SearchFilter): string {
+export interface NormalizedKeyword {
+  /** 引号外的裸词（已折叠空白）。 */
+  keyword: string
+  /** 整串被引号包住：用户明确要精确短语。 */
+  phrase: boolean
+  /** 局部引号内的短语（按出现顺序）。 */
+  quoted: string[]
+}
+
+/**
+ * 归一化用户关键词：识别「用户加了引号 = 想要精确短语」的意图。
+ * - 整串被引号包住（"a b c"）：整串作为短语。
+ * - 局部有引号（a "b c" d）：引号内作为短语，引号外仍按 AND 拆词。
+ * - 无引号：剥离残留引号字符，避免其进入 search_query 造成 HTTP 400。
+ */
+export function normalizeKeyword(raw: string): NormalizedKeyword {
+  const trimmed = raw.trim()
+  const whole = /^["“”](.+)["“”]$/u.exec(trimmed)
+  if (whole) return { keyword: whole[1]!.trim(), phrase: true, quoted: [] }
+  const quoted: string[] = []
+  const rest = trimmed.replace(/["“”]([^"“”]+)["“”]/gu, (_match, inner: string) => {
+    const piece = inner.trim()
+    if (piece) quoted.push(piece)
+    return ' '
+  })
+  const bare = rest.replace(/["“”]/gu, ' ').replace(/\s+/gu, ' ').trim()
+  // 整串就是一个带引号的短语（引号外没有别的词）时，等价于整串短语。
+  if (bare === '' && quoted.length === 1) return { keyword: quoted[0]!, phrase: true, quoted: [] }
+  return { keyword: bare, phrase: false, quoted }
+}
+
+/**
+ * 构建 arXiv search_query（关键词 + 作者 + 年份范围）。
+ * @param matchMode - 显式匹配方式；缺省时取 filter.matchMode，
+ *   再缺省才按「关键词自带整串引号 → phrase，否则 all」推断。
+ */
+export function buildArxivQuery(filter: SearchFilter, matchMode?: MatchMode): string {
+  const mode = matchMode ?? filter.matchMode
   const parts: string[] = []
-  const keyword = filter.keyword.trim()
-  if (!keyword) {
+  const normalized = normalizeKeyword(filter.keyword)
+  const keyword = normalized.keyword
+  const quoted = normalized.quoted
+
+  if (keyword === '' && quoted.length === 0) {
     throw new AcademicSourceError('INVALID_ARG', 'academic_search: keyword 不能为空')
   }
-  parts.push(`all:"${escapeQueryToken(keyword)}"`)
+
+  if (mode === 'phrase') {
+    // 显式要求精确短语：用整串关键词（退而用第一段引号内容）。
+    const phraseText = keyword !== '' ? keyword : quoted[0]!
+    parts.push(`all:"${escapeQueryToken(phraseText)}"`)
+  } else if (mode !== 'all' && normalized.phrase) {
+    // 用户整体加了引号且未显式要求 all：尊重其精确短语意图。
+    parts.push(`all:"${escapeQueryToken(keyword)}"`)
+  } else {
+    // 默认：拆词 AND，召回显著高于精确短语；引号内的短语作为整体参与 AND。
+    const terms: string[] = []
+    if (keyword !== '') terms.push(...keyword.split(/\s+/u).filter(Boolean))
+    terms.push(...quoted)
+    if (terms.length === 0) {
+      throw new AcademicSourceError('INVALID_ARG', 'academic_search: keyword 不能为空')
+    }
+    parts.push(terms.map((term) => `all:"${escapeQueryToken(term)}"`).join(' AND '))
+  }
+
   if (filter.author && filter.author.trim() !== '') {
     parts.push(`AND au:"${escapeQueryToken(filter.author.trim())}"`)
   }
@@ -124,11 +193,12 @@ function parseFeed(xml: string): Paper[] {
 
 /** 统一搜索入口。 */
 export async function searchArxiv(filter: SearchFilter, opts: HttpOptions): Promise<Paper[]> {
-  const searchQuery = buildArxivQuery(filter)
+  const searchQuery = buildArxivQuery(filter, filter.matchMode)
   const { sortBy, sortOrder } = sortParam(filter.sort)
   const maxResults = Math.min(Math.max(1, filter.maxResults), 50)
   const url = `${ARXIV_API}?search_query=${encodeURIComponent(searchQuery)}&start=0&max_results=${maxResults}&sortBy=${sortBy}&sortOrder=${sortOrder}`
-  const xml = await httpTextWithRetry(() => httpText(url, opts))
+  cooldownGuard('arxiv', 'arXiv')
+  const xml = await httpTextWithRetry(() => gateArxiv(() => httpText(url, opts)), ARXIV_RETRY_FALLBACK_MS)
   return parseFeed(xml)
 }
 
@@ -139,7 +209,8 @@ export async function arxivDetail(arxivId: string, opts: HttpOptions): Promise<P
     throw new AcademicSourceError('INVALID_ARG', `无效的 arXiv ID：${arxivId}`)
   }
   const url = `${ARXIV_API}?id_list=${encodeURIComponent(id)}&max_results=1`
-  const xml = await httpTextWithRetry(() => httpText(url, opts))
+  cooldownGuard('arxiv', 'arXiv')
+  const xml = await httpTextWithRetry(() => gateArxiv(() => httpText(url, opts)), ARXIV_RETRY_FALLBACK_MS)
   const papers = parseFeed(xml)
   return papers[0] ?? null
 }
@@ -147,7 +218,8 @@ export async function arxivDetail(arxivId: string, opts: HttpOptions): Promise<P
 /** 按 DOI 在 arXiv 检索（详情工具兜底路径：arXiv 元数据无 DOI 时返回 null）。 */
 export async function arxivSearchByDoi(doi: string, opts: HttpOptions): Promise<Paper | null> {
   const url = `${ARXIV_API}?search_query=${encodeURIComponent(`all:"${escapeQueryToken(doi)}"`)}&start=0&max_results=3&sortBy=relevance&sortOrder=descending`
-  const xml = await httpTextWithRetry(() => httpText(url, opts))
+  cooldownGuard('arxiv', 'arXiv')
+  const xml = await httpTextWithRetry(() => gateArxiv(() => httpText(url, opts)), ARXIV_RETRY_FALLBACK_MS)
   const papers = parseFeed(xml)
   return papers.find((paper) => paper.doi && paper.doi.toLowerCase() === doi.toLowerCase()) ?? papers[0] ?? null
 }

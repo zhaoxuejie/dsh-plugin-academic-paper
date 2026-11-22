@@ -111,13 +111,69 @@ export function todayString(): string {
   return `${d.getFullYear()}-${month}-${day}`
 }
 
+/** 期刊引用串的结构化解析结果。raw 总是保留原始串，供解析失败时回退。 */
+export interface ParsedJournalRef {
+  name?: string
+  volume?: string
+  issue?: string
+  pages?: string
+  year?: string
+  /** 原始 journal 串（arXiv 的 arxiv:journal_ref 或 S2 的 venue）。 */
+  raw?: string
+}
+
+/**
+ * 解析期刊引用串。
+ *
+ * arXiv 的 arxiv:journal_ref 是自由文本，各刊各年代格式不统一，典型形如
+ * `Physical Review Research vol. 4, no. 2, page 023066, April 2022`。
+ * 之前这个串被原样拼进 GB/T 7714 的 [J] 段，输出成
+ * `Physical Review Research vol. 4, no. 2, page 023066, April 2022, 2020` —— 卷期页码成了自由文本，
+ * 年份还出现两次且互相矛盾（刊年 2022 vs arXiv 预印本年 2020）。
+ *
+ * 解析失败时返回仅含 raw 的对象，由调用方回退原文，绝不丢信息。
+ */
+export function parseJournalRef(raw?: string): ParsedJournalRef {
+  if (typeof raw !== 'string') return {}
+  const text = raw.trim()
+  if (text === '') return {}
+  try {
+    const volume = /\bvol\.?\s*([\w.]+)/iu.exec(text)?.[1]
+    const issue = /\b(?:no\.?|issue|number)\.?\s*([\w.]+)/iu.exec(text)?.[1]
+    const pages = /\b(?:pages?|pp)\.?\s*([\w–—-]+)/iu.exec(text)?.[1]
+    const year = /\b(?:19|20)\d{2}\b/u.exec(text)?.[0]
+    // 刊名 = 到第一个分隔符（逗号/分号）或卷期页码标记为止的那一段。
+    const head = text.split(/[,;]|\bvol\.?|\bno\.?|\bpages?\b|\bpp\.?\b/iu)[0]
+    const name = head && head.trim() !== '' ? head.trim().replace(/\.$/u, '') : undefined
+    const parsed: ParsedJournalRef = { name, volume, issue, pages, year, raw: text }
+    // 只有真的解析出刊名或卷期才算成功，否则交给调用方回退原文。
+    if (!parsed.name && !parsed.volume && !parsed.issue) return { raw: text }
+    return parsed
+  } catch {
+    return { raw: text }
+  }
+}
+
 /** GB/T 7714-2015 引用。 */
 export function formatGbT7714(paper: Paper, citedDate = todayString()): string {
   const authorPart = gbAuthorPart(paper.authors)
   const title = paper.title.trim() || '(无题名)'
   const journal = paper.journal?.trim()
   if (journal) {
-    const base = `${authorPart}. ${title}[J]. ${journal}, ${paper.year > 0 ? paper.year : '出版年不详'}.`
+    const j = parseJournalRef(journal)
+    // 期刊正式出版年优先于 arXiv 预印本年，避免「2022, 2020」这类矛盾。
+    const year = j.year ?? (paper.year > 0 ? String(paper.year) : '出版年不详')
+    let cite: string
+    if (j.name) {
+      const volPart = j.volume ? `, ${j.volume}` : ''
+      const issuePart = j.issue ? `(${j.issue})` : ''
+      const pagePart = j.pages ? `: ${j.pages}` : ''
+      cite = `${j.name}, ${year}${volPart}${issuePart}${pagePart}`
+    } else {
+      // 解析失败：保留原始串，只补年份，不丢信息。
+      cite = `${journal}${/\b(?:19|20)\d{2}\b/u.test(journal) ? '' : `, ${year}`}`
+    }
+    const base = `${authorPart}. ${title}[J]. ${cite}.`
     return paper.doi ? `${base} DOI: ${paper.doi}.` : base
   }
   // 电子文献（arXiv 预印本等）
@@ -134,12 +190,25 @@ export function formatApa(paper: Paper): string {
   const authorPart = apaAuthorPart(paper.authors)
   const yearPart = paper.year > 0 ? String(paper.year) : 'n.d.'
   const title = paper.title.trim() || '(Untitled)'
-  const source = paper.journal?.trim()
-    || (paper.arxivId && ARXIV_RE.test(paper.arxivId) ? `arXiv preprint arXiv:${paper.arxivId}` : '')
+  const journalRaw = paper.journal?.trim()
+  const journalParsed: ParsedJournalRef = journalRaw ? parseJournalRef(journalRaw) : {}
+  // 期刊正式出版年优先于 arXiv 预印本年。
+  const apaYear = journalParsed.year ?? yearPart
+  let source = ''
+  if (journalParsed.name) {
+    const volPart = journalParsed.volume ? `, ${journalParsed.volume}` : ''
+    const issuePart = journalParsed.issue ? `(${journalParsed.issue})` : ''
+    const pagePart = journalParsed.pages ? `, ${journalParsed.pages}` : ''
+    source = `${journalParsed.name}${volPart}${issuePart}${pagePart}`
+  } else if (journalRaw) {
+    source = journalRaw
+  } else if (paper.arxivId && ARXIV_RE.test(paper.arxivId)) {
+    source = `arXiv preprint arXiv:${paper.arxivId}`
+  }
   const location = paper.doi
     ? `https://doi.org/${paper.doi}`
     : (paper.pdfUrl || paper.officialUrl)
-  const head = authorPart ? `${authorPart} (${yearPart}). ${title}.` : `${title}. (${yearPart}).`
+  const head = authorPart ? `${authorPart} (${apaYear}). ${title}.` : `${title}. (${apaYear}).`
   const sourcePart = source ? ` ${source}.` : ''
   return `${head}${sourcePart}${location ? ` ${location}` : ''}`
 }
@@ -152,7 +221,13 @@ export function formatBibtex(paper: Paper): string {
   if (paper.authors.length > 0) fields.push(['author', `{${bibAuthorPart(paper.authors)}}`])
   if (paper.year > 0) fields.push(['year', String(paper.year)])
   const journal = paper.journal?.trim()
-  if (journal) fields.push(['journal', `{${escapeLatex(journal)}}`])
+  if (journal) {
+    const parsed = parseJournalRef(journal)
+    fields.push(['journal', `{${escapeLatex(parsed.name ?? journal)}}`])
+    if (parsed.volume) fields.push(['volume', parsed.volume])
+    if (parsed.issue) fields.push(['number', parsed.issue])
+    if (parsed.pages) fields.push(['pages', parsed.pages])
+  }
   if (paper.doi) fields.push(['doi', paper.doi])
   if (paper.arxivId && ARXIV_RE.test(paper.arxivId)) {
     fields.push(['eprint', paper.arxivId])

@@ -22,7 +22,8 @@ import { AcademicSourceError } from './types'
 import type { ExecLike, HttpOptions, Paper, ResolvedConfig, SourceSelection, ToolDefinition } from './types'
 
 export const name = 'dsh-plugin-academic-paper'
-export const inject = ['tools', 'settings']
+// webServer 用于注册侧边面板的数据路由；缺失时面板静默不可用，因此必须显式声明依赖。
+export const inject = ['tools', 'settings', 'webServer']
 
 /* ------------------------------------------------------------------ */
 /* 配置（对应 PRD §3.3 配置项）                                        */
@@ -38,18 +39,22 @@ export interface Config {
   max_cache_entries: number
   cache_ttl_seconds: number
   max_library_size: number
+  semantic_scholar_api_key: string
 }
 
 export const Config: Schema<Config> = Schema.object({
   enable: Schema.boolean().default(true),
-  default_source: Schema.union(['arxiv', 'semantic_scholar', 'both']).default('semantic_scholar'),
+  // 默认源改 arXiv：S2 未鉴权时是全体未鉴权用户共享的限流池，实测连续 429，不适合做默认。
+  default_source: Schema.union(['arxiv', 'semantic_scholar', 'both']).default('arxiv'),
   max_results: Schema.number().min(1).max(50).default(10),
   default_cite_format: Schema.union(['gb_t_7714', 'apa', 'bibtex']).default('gb_t_7714'),
-  request_timeout: Schema.number().min(1).max(120).default(15),
+  // 15 秒对复杂短语查询不够：实测这类查询 15–45 秒，会先撞超时再白等一次重试。
+  request_timeout: Schema.number().min(1).max(120).default(30),
   enable_cache: Schema.boolean().default(true),
   max_cache_entries: Schema.number().min(10).max(500).default(50),
   cache_ttl_seconds: Schema.number().min(0).max(86400).default(300),
   max_library_size: Schema.number().min(10).max(5000).default(500),
+  semantic_scholar_api_key: Schema.string().default(''),
 })
 
 /** 归一化配置：容忍非法输入、回退默认值（settings 未就绪或 entryConfig 缺键时兜底）。 */
@@ -63,16 +68,23 @@ export function resolveConfig(raw: unknown): ResolvedConfig {
     const n = Number(v)
     return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.floor(n))) : fallback
   }
+  // API Key：配置项优先，缺省回退环境变量 S2_API_KEY（只读环境变量即可，密钥不必落盘）。
+  const apiKeyFromEnv = typeof process !== 'undefined' && process.env ? process.env.S2_API_KEY : undefined
+  const apiKey = typeof src.semantic_scholar_api_key === 'string' && src.semantic_scholar_api_key.trim() !== ''
+    ? src.semantic_scholar_api_key.trim()
+    : (typeof apiKeyFromEnv === 'string' && apiKeyFromEnv.trim() !== '' ? apiKeyFromEnv.trim() : '')
   return {
     enable: src.enable !== false,
-    default_source: asSource(src.default_source, 'semantic_scholar'),
+    // 两处默认值必须一致：只改 Schema 不改这里，settings 缺键时会退回旧默认。
+    default_source: asSource(src.default_source, 'arxiv'),
     max_results: clampInt(src.max_results, 10, 1, 50),
     default_cite_format: asFormat(src.default_cite_format),
-    request_timeout: clampInt(src.request_timeout, 15, 1, 120),
+    request_timeout: clampInt(src.request_timeout, 30, 1, 120),
     enable_cache: src.enable_cache !== false,
     max_cache_entries: clampInt(src.max_cache_entries, 50, 10, 500),
     cache_ttl_seconds: clampInt(src.cache_ttl_seconds, 300, 0, 86400),
     max_library_size: clampInt(src.max_library_size, 500, 10, 5000),
+    semantic_scholar_api_key: apiKey,
   }
 }
 
@@ -268,29 +280,41 @@ async function resolvePaper(
     let paper: Paper | null = null
     if (paperId.startsWith('arxiv:')) {
       paper = await tryArxivThenS2(paperId.slice(6))
+      if (paper) return paper
     } else if (paperId.startsWith('s2:')) {
       paper = await semanticScholarDetail({ paperId: paperId.slice(3) }, opts)
+      if (paper) return paper
     } else if (ARXIV_ID_RE.test(paperId)) {
       paper = await tryArxivThenS2(paperId)
+      if (paper) return paper
     } else if (/^10\.\S+$/i.test(paperId)) {
       paper = await semanticScholarDetail({ doi: paperId }, opts)
       if (!paper) paper = await arxivSearchByDoi(paperId, opts)
+      if (paper) return paper
     } else {
       // S2 的 40 位 paperId 或 CorpusId
       paper = await semanticScholarDetail({ paperId }, opts)
+      // 非标准标识（既不是 arXiv ID 也不是 DOI）在 S2 找不到就没有别的兜底路径了，
+      // 继续往下跑只会用同样的字符串再打一遍上游。
+      return paper ?? raiseNotFound(args)
     }
-    if (paper) return paper
   }
-  if (args.doi?.trim()) {
+  // 下面两段只在 paperId 未命中时兜底；同一个标识已在上面试过的不再重复。
+  if (args.doi?.trim() && args.doi.trim() !== paperId) {
     const paper = await semanticScholarDetail({ doi: args.doi.trim() }, opts)
     if (paper) return paper
     const byArxiv = await arxivSearchByDoi(args.doi.trim(), opts)
     if (byArxiv) return byArxiv
   }
-  if (args.arxivId?.trim()) {
+  if (args.arxivId?.trim() && args.arxivId.trim() !== paperId) {
     const paper = await tryArxivThenS2(args.arxivId.trim())
     if (paper) return paper
   }
+  throw raiseNotFound(args)
+}
+
+/** 统一的「没找到」错误，避免 paperId / doi / arxivId 三处各拼一遍。 */
+function raiseNotFound(args: { paperId?: string; doi?: string; arxivId?: string }): never {
   throw new AcademicSourceError(
     'NOT_FOUND',
     `未找到对应的文献（paperId=${args.paperId ?? '-'}，doi=${args.doi ?? '-'}，arxivId=${args.arxivId ?? '-'}）。请先用 academic_search 检索，或核对标识是否正确。`,
@@ -330,7 +354,11 @@ function assertEnabled(config: ResolvedConfig): void {
 }
 
 function httpOpts(config: ResolvedConfig, exec: ExecLike): HttpOptions {
-  return { timeoutMs: config.request_timeout * 1000, signal: exec.signal }
+  return {
+    timeoutMs: config.request_timeout * 1000,
+    signal: exec.signal,
+    s2ApiKey: config.semantic_scholar_api_key || undefined,
+  }
 }
 
 function sessionKeyOf(exec: ExecLike): string {
@@ -394,6 +422,11 @@ export function apply(ctx: ContextLike, entryConfig: unknown): void {
       properties: {
         keyword: { type: 'string', description: '检索关键词（论文标题/摘要/主题词），必填' },
         source: { type: 'string', enum: ['arxiv', 'semantic_scholar', 'both'], description: '数据源；缺省使用插件配置 default_source' },
+        matchMode: {
+          type: 'string',
+          enum: ['all', 'phrase'],
+          description: '关键词匹配方式：all=每个词都出现即可（默认，召回高）；phrase=连续完整短语（精度高，召回低）。关键词自带引号时自动按 phrase 处理',
+        },
         yearFrom: { type: 'number', description: '起始年份（含）' },
         yearTo: { type: 'number', description: '截止年份（含）' },
         author: { type: 'string', description: '作者姓名过滤（Semantic Scholar 源在本地过滤）' },
@@ -429,36 +462,47 @@ export function apply(ctx: ContextLike, entryConfig: unknown): void {
         return searchSemanticScholar(filter, opts)
       }
 
-      let papers: Paper[]
-      const errors: string[] = []
-      if (source === 'both') {
-        const [arxivResult, s2Result] = await Promise.allSettled([
-          runSource('arxiv'),
-          runSource('semantic_scholar'),
-        ])
-        if (arxivResult.status === 'rejected') errors.push(`arXiv 检索失败：${messageOf(arxivResult.reason)}`)
-        if (s2Result.status === 'rejected') errors.push(`Semantic Scholar 检索失败：${messageOf(s2Result.reason)}`)
-        const arxivPapers = arxivResult.status === 'fulfilled' ? arxivResult.value : []
-        const s2Papers = s2Result.status === 'fulfilled' ? s2Result.value : []
-        papers = mergePapers(arxivPapers, s2Papers)
-        if (papers.length === 0 && errors.length > 0) {
-          throw new AcademicSourceError('SEARCH_FAILED', `检索失败：${errors.join('；')}`, true)
+      /**
+       * 真正打上游的一段。外层用 singleFlight 包住：缓存写点在请求之后，
+       * 两条相同查询并发进来都会 cache miss，此处让后者复用前者的 Promise，
+       * 不再各发一次请求。
+       */
+      const fetchPapers = async (): Promise<{ papers: Paper[]; errors: string[] }> => {
+        const errors: string[] = []
+        if (source === 'both') {
+          const [arxivResult, s2Result] = await Promise.allSettled([
+            runSource('arxiv'),
+            runSource('semantic_scholar'),
+          ])
+          if (arxivResult.status === 'rejected') errors.push(`arXiv 检索失败：${messageOf(arxivResult.reason)}`)
+          if (s2Result.status === 'rejected') errors.push(`Semantic Scholar 检索失败：${messageOf(s2Result.reason)}`)
+          const arxivPapers = arxivResult.status === 'fulfilled' ? arxivResult.value : []
+          const s2Papers = s2Result.status === 'fulfilled' ? s2Result.value : []
+          const merged = mergePapers(arxivPapers, s2Papers)
+          if (merged.length === 0 && errors.length > 0) {
+            throw new AcademicSourceError('SEARCH_FAILED', `检索失败：${errors.join('；')}`, true)
+          }
+          return { papers: merged, errors }
         }
-      } else {
         try {
-          papers = await runSource(source)
+          return { papers: await runSource(source), errors }
         } catch (error) {
           throw error instanceof AcademicSourceError
             ? error
             : new AcademicSourceError('SEARCH_FAILED', `检索失败：${messageOf(error)}`, true)
         }
       }
-      papers = sortPapers(papers, filter.sort).slice(0, filter.maxResults)
 
+      // 缓存命中时 errors 恒为空（缓存只存成功结果），因此复用同一条返回路径即可。
+      const outcome = config.enable_cache
+        ? await store.singleFlight(session, cacheKey, fetchPapers)
+        : await fetchPapers()
+
+      const papers = sortPapers(outcome.papers, filter.sort).slice(0, filter.maxResults)
       if (config.enable_cache) store.cacheSet(session, cacheKey, papers, config.max_cache_entries)
       store.recordSearch(session, keyword, papers.length)
       for (const paper of papers) store.remember(session, paper)
-      return { papers: papers.map(cleanPaper), query: keyword, source, total: papers.length, errors }
+      return { papers: papers.map(cleanPaper), query: keyword, source, total: papers.length, errors: outcome.errors }
     },
   })
 
@@ -790,9 +834,21 @@ export {
   bibtexKey,
   splitName,
   escapeLatex,
+  parseJournalRef,
 } from './citation'
 export { AcademicStore, cacheKeyOf, buildFilter } from './library'
-export { searchArxiv, arxivDetail, arxivSearchByDoi } from './sources/arxiv'
+export { buildArxivQuery, normalizeKeyword, searchArxiv, arxivDetail, arxivSearchByDoi } from './sources/arxiv'
 export { searchSemanticScholar, semanticScholarDetail } from './sources/semantic-scholar'
+export {
+  cooldownGuard,
+  gateArxiv,
+  gateFor,
+  gateS2,
+  resetCooldown,
+  retryWaitOf,
+  setCooldown,
+  upstreamOf,
+} from './http'
 export { parseXml, findChild, findAllChildren, findAllDescendants, textOfCollapsed } from './xml'
+export { AcademicSourceError } from './types'
 export type { Paper, CitationFormat, PaperSource, ResolvedConfig } from './types'

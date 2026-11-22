@@ -39,6 +39,8 @@ export function cacheKeyOf(key: CacheKey): string {
     f.yearFrom ?? '',
     f.yearTo ?? '',
     f.sort,
+    // matchMode 会改变 arXiv 查询构造，必须进 key，否则 phrase / all 互相串味。
+    f.matchMode ?? '',
     f.maxResults,
   ].join('|')
 }
@@ -50,6 +52,13 @@ function normTitle(title: string): string {
 
 export class AcademicStore {
   private readonly sessions = new Map<string, SessionState>()
+
+  /**
+   * 同 key 的并发检索去重（single-flight）。
+   * 缓存写点在请求之后（cacheSet 在网络返回后），两次相同查询并发进来都会 cache miss，
+   * 于是各发一次上游请求。这里让后来的调用直接复用第一个调用的结果。
+   */
+  private readonly inflight = new Map<string, Promise<unknown>>()
 
   state(sessionKey = DEFAULT_SESSION): SessionState {
     let state = this.sessions.get(sessionKey)
@@ -166,6 +175,21 @@ export class AcademicStore {
     return hit.papers
   }
 
+  /**
+   * 同 key 并发去重：已有在飞的同名检索就复用它的 Promise。
+   * @param factory - 真正发起检索的函数；只在没有在飞请求时调用。
+   */
+  singleFlight<T>(sessionKey: string, key: string, factory: () => Promise<T>): Promise<T> {
+    const flightKey = `${sessionKey}|${key}`
+    const running = this.inflight.get(flightKey)
+    if (running) return running as Promise<T>
+    const task = factory().finally(() => {
+      this.inflight.delete(flightKey)
+    })
+    this.inflight.set(flightKey, task)
+    return task
+  }
+
   /** 写入检索缓存（超上限时淘汰最旧条目）。 */
   cacheSet(sessionKey: string, key: string, papers: Paper[], maxEntries: number): void {
     const s = this.state(sessionKey)
@@ -233,6 +257,7 @@ export class AcademicStore {
   /** 卸载清理：清空全部会话状态（PRD §4.2）。 */
   clearAll(): void {
     this.sessions.clear()
+    this.inflight.clear()
   }
 }
 
@@ -250,6 +275,7 @@ export function buildFilter(args: Record<string, unknown>, config: ResolvedConfi
     throw new Error(`academic_search: 年份范围无效（${yearFrom} > ${yearTo}）`)
   }
   const sort = args.sort === 'date' || args.sort === 'citations' ? args.sort : 'relevance'
+  const matchMode = args.matchMode === 'phrase' || args.matchMode === 'all' ? args.matchMode : undefined
   const maxResults = num(args.maxResults) !== undefined
     ? Math.min(Math.max(1, num(args.maxResults)!), 50)
     : config.max_results
@@ -260,5 +286,6 @@ export function buildFilter(args: Record<string, unknown>, config: ResolvedConfi
     yearTo,
     maxResults,
     sort,
+    matchMode,
   }
 }
